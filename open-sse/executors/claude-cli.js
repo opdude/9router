@@ -3,6 +3,17 @@ import { tmpdir } from "node:os";
 import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
 import { SSE_HEADERS, SSE_DONE } from "../utils/sseConstants.js";
+import { HTTP_STATUS } from "../config/runtimeConfig.js";
+
+// Same phrase classes the `claude` CLI itself checks for internally (extracted from its
+// own bundled auth-error regex) — reused here so chatCore's combo/account fallback
+// treats these the same as any other provider's auth/quota failure (see chatCore.js's
+// `!providerResponse.ok` branch), instead of silently swallowing them into a 200
+// response with the error baked into the assistant's reply text.
+const AUTH_ERROR_PATTERN = /not logged in|please run \/login|authentication failed|invalid api key|oauth token (?:expired|revoked)|401 unauthorized|403 forbidden|token (?:has )?expired|bad credentials/i;
+// Quota/billing exhaustion — distinct from auth so it maps to 429 (rate limited) rather
+// than 401, giving it accountFallback's backoff/retry-after handling instead of a flat lock.
+const QUOTA_ERROR_PATTERN = /usage limit reached|credit balance (?:is )?too low/i;
 
 const CLAUDE_BIN = process.env.CLAUDE_CLI_PATH || "claude";
 
@@ -87,6 +98,16 @@ export class ClaudeCliExecutor extends BaseExecutor {
     super("claude-cli", PROVIDERS["claude-cli"]);
   }
 
+  // Executor-specific so parseUpstreamError() picks up the plain message we stuffed
+  // into the JSON error body below, instead of stringifying the whole object.
+  parseError(response, bodyText) {
+    try {
+      const parsed = JSON.parse(bodyText);
+      if (parsed?.error?.message) return { status: response.status, message: parsed.error.message };
+    } catch {}
+    return { status: response.status, message: bodyText || `HTTP ${response.status}` };
+  }
+
   // Fully overridden — this provider shells out to a local CLI process instead of
   // making an HTTP call, so none of BaseExecutor's fetch/retry/fallback machinery applies.
   async execute({ model, body, signal, log }) {
@@ -115,18 +136,71 @@ export class ClaudeCliExecutor extends BaseExecutor {
 
     const encoder = new TextEncoder();
     const state = { model, sawMessageStart: false };
-    let buffer = "";
+
+    // Don't commit to a response (and therefore an HTTP status) until we know whether
+    // the CLI actually started a turn or failed outright (e.g. "Not logged in" with no
+    // assistant content at all). Committing to 200 unconditionally — as an earlier
+    // version of this executor did — meant chatCore's `!providerResponse.ok` fallback
+    // check never fired, so a dead session silently "succeeded" with the error text
+    // baked into the assistant's reply instead of the combo trying the next model.
+    let rawBuffer = "";
+    const pendingLines = [];
+    const outcome = await new Promise((resolve) => {
+      let settled = false;
+      const settle = (result) => {
+        if (settled) return;
+        settled = true;
+        child.stdout.off("data", onData);
+        child.stdout.off("end", onEnd);
+        resolve(result);
+      };
+      const onData = (chunk) => {
+        rawBuffer += chunk.toString("utf8");
+        const lines = rawBuffer.split("\n");
+        rawBuffer = lines.pop() || "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          pendingLines.push(trimmed);
+          let parsed;
+          try { parsed = JSON.parse(trimmed); } catch { continue; }
+          if (parsed.type === "stream_event") return settle({ ok: true });
+          if (parsed.type === "result" && parsed.is_error) {
+            return settle({ ok: false, message: parsed.result || "claude CLI reported an error with no response" });
+          }
+        }
+      };
+      const onEnd = () => settle({ ok: false, message: stderrBuf.trim() || "claude CLI exited with no output" });
+      child.stdout.on("data", onData);
+      child.stdout.on("end", onEnd);
+      child.once("error", (err) => settle({ ok: false, message: err.message || "claude CLI process error" }));
+    });
+
+    if (!outcome.ok) {
+      onAbort();
+      const status = QUOTA_ERROR_PATTERN.test(outcome.message)
+        ? HTTP_STATUS.RATE_LIMITED
+        : AUTH_ERROR_PATTERN.test(outcome.message)
+          ? HTTP_STATUS.UNAUTHORIZED
+          : HTTP_STATUS.BAD_GATEWAY;
+      const response = new Response(
+        JSON.stringify({ error: { message: outcome.message, type: "claude_cli_error" } }),
+        { status, headers: { "Content-Type": "application/json" } }
+      );
+      return { response, url: "claude-cli://local", headers: {}, transformedBody: body };
+    }
 
     const body_ = new ReadableStream({
       start(controller) {
+        for (const line of pendingLines) emitLine(line, controller, encoder, state);
         child.stdout.on("data", chunk => {
-          buffer += chunk.toString("utf8");
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
+          rawBuffer += chunk.toString("utf8");
+          const lines = rawBuffer.split("\n");
+          rawBuffer = lines.pop() || "";
           for (const line of lines) emitLine(line, controller, encoder, state);
         });
         child.stdout.on("end", () => {
-          if (buffer.trim()) emitLine(buffer, controller, encoder, state);
+          if (rawBuffer.trim()) emitLine(rawBuffer, controller, encoder, state);
           controller.enqueue(encoder.encode(SSE_DONE));
           controller.close();
         });
