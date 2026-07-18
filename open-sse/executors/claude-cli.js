@@ -49,6 +49,15 @@ function buildTranscript(messages = []) {
     .join("\n\n");
 }
 
+// `claude -p` keeps Claude Code's full agentic persona (skills, memory-recall instincts,
+// tool-use reflexes) baked in regardless of --tools — leaving the default system prompt
+// in place (i.e. not passing --system-prompt at all) reproducibly caused the model to
+// narrate/hallucinate fake tool-call syntax as plain text once real tools were stripped,
+// and to otherwise behave like an interactive coding agent rather than a plain assistant
+// answering one request. Passing --system-prompt replaces the default wholesale, which
+// fixes this; the caller's own system message (if any) is appended after our baseline.
+const BASE_SYSTEM_PROMPT = "You are a helpful assistant. Answer directly and concisely. You have no tools available in this session — do not attempt, narrate, or simulate any tool calls.";
+
 function buildArgs(model, body) {
   const args = [
     "-p", "--output-format", "stream-json", "--include-partial-messages", "--verbose",
@@ -59,8 +68,9 @@ function buildArgs(model, body) {
     "--no-session-persistence",
     "--setting-sources", "user",
   ];
-  const system = flattenContent(body.system);
-  if (system) args.push("--system-prompt", system);
+  const callerSystem = flattenContent(body.system);
+  const system = callerSystem ? `${BASE_SYSTEM_PROMPT}\n\n${callerSystem}` : BASE_SYSTEM_PROMPT;
+  args.push("--system-prompt", system);
   return args;
 }
 
