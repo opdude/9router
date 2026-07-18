@@ -5,7 +5,7 @@
 export default {
   id: "claude-cli",
   priority: 10,
-  alias: "claude-cli",
+  alias: "cli",
   uiAlias: "cli",
   display: {
     name: "Claude Code CLI",
