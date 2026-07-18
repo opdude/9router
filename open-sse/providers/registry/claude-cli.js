@@ -9,7 +9,7 @@ export default {
   uiAlias: "cli",
   display: {
     name: "Claude Code CLI",
-    icon: "terminal",
+    icon: "smart_toy",
     color: "#D97757",
     website: "https://claude.ai",
     notice: {
