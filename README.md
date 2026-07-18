@@ -342,11 +342,18 @@ Default URLs:
         <b>Vertex AI</b><br/>
         <sub>Gemini 3 Pro + GLM-5 + DeepSeek<br/>$300 credits free</sub>
       </td>
+      <td align="center" width="150">
+        <img src="./public/providers/claude.png" width="70" alt="Claude Code CLI"/><br/>
+        <b>Claude Code CLI</b><br/>
+        <sub>Runs `claude -p` on the host<br/>Uses your own subscription</sub>
+      </td>
     </tr>
   </table>
 </div>
 
 > **Note:** iFlow, Qwen and Gemini CLI free tiers were discontinued in 2026. Use Kiro / OpenCode Free / Vertex instead.
+
+> **Claude Code CLI provider:** unlike the other entries above, this doesn't add free capacity — it lets you route through the [Claude Code CLI](https://claude.ai) session you're already logged into on the machine running 9Router (`claude -p` under the hood), so requests still count against that subscription's own usage. Useful for combining Claude with fallback/combo routing to other providers, or driving it from tools that only speak the 9Router/OpenAI-compatible endpoint. Requires the `claude` CLI installed and logged in wherever 9Router runs (the official Docker image includes it). See [Docker: mounting your `claude` CLI session](#docker) below.
 
 ### 🔑 API Key Providers (40+)
 
@@ -1208,6 +1215,18 @@ docker pull decolua/9router:latest   # update to latest
 ```
 
 **Data persistence:** `$HOME/.9router/db/data.sqlite` on host ↔ `/app/data/db/data.sqlite` in container.
+
+**Optional: Claude Code CLI provider.** To use the `claude-cli` provider (routes requests through the host's logged-in `claude` CLI session instead of an API key), bind-mount your `~/.claude` directory read-write (the CLI needs to *refresh* its stored token, not just read it) and point `CLAUDE_CONFIG_DIR` at it — the container's `node` user's home is `/home/node`, not `/root`:
+
+```bash
+docker run -d --name 9router -p 20128:20128 \
+  -v "$HOME/.9router:/app/data" -e DATA_DIR=/app/data \
+  -v "$HOME/.claude:/home/node/.claude" \
+  -e CLAUDE_CONFIG_DIR=/home/node/.claude \
+  decolua/9router:latest
+```
+
+Not needed for any other provider — skip this mount and env var entirely if you don't use `claude-cli`. On SELinux-enforcing hosts (Fedora/RHEL family), add the `:z` mount flag (`-v "$HOME/.claude:/home/node/.claude:z"`) or the bind mount will be silently denied regardless of file permissions.
 
 ### Environment Variables
 

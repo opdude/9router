@@ -3,6 +3,7 @@ import { createErrorResult } from "../../utils/error.js";
 import { HTTP_STATUS } from "../../config/runtimeConfig.js";
 import { FORMATS } from "../../translator/formats.js";
 import { PROVIDERS } from "../../config/providers.js";
+import { translateResponse, initState } from "../../translator/index.js";
 import { buildRequestDetail, extractRequestConfig, saveUsageStats, formatDoneLine } from "./requestDetail.js";
 
 // Responses-API providers (e.g. codex) may emit SSE without content-type + use Responses output shape
@@ -38,7 +39,15 @@ function pickAssistantMessageForChatCompletion(output) {
  * Parse OpenAI-style SSE text into a single chat completion JSON.
  * Used when provider forces streaming but client wants non-streaming.
  */
-export function parseSSEToOpenAIResponse(rawSSE, fallbackModel) {
+export function parseSSEToOpenAIResponse(rawSSE, fallbackModel, targetFormat = null) {
+  // Most forceStream executors (commandcode, openai, codex) pre-convert to OpenAI
+  // chat.completion.chunk shape themselves before returning the response, so
+  // most raw SSE payloads already have `.choices`. Providers that instead emit
+  // their own untranslated wire format (e.g. claude-cli, format "claude") rely on
+  // this aggregator to run the same target->openai translation the real
+  // streaming path applies per chunk — sniff each payload's shape rather than
+  // trusting the registry format, since it doesn't tell them apart.
+  const state = targetFormat ? initState(FORMATS.OPENAI) : null;
   const chunks = [];
 
   for (const line of String(rawSSE || "").split("\n")) {
@@ -46,9 +55,21 @@ export function parseSSEToOpenAIResponse(rawSSE, fallbackModel) {
     if (!trimmed.startsWith("data:")) continue;
     const payload = trimmed.slice(5).trim();
     if (!payload || payload === "[DONE]") continue;
-    try { chunks.push(JSON.parse(payload)); } catch { /* ignore malformed lines */ }
+    let parsed;
+    try { parsed = JSON.parse(payload); } catch { continue; }
+
+    if (parsed?.choices || !targetFormat) {
+      chunks.push(parsed);
+      continue;
+    }
+    const translated = translateResponse(targetFormat, FORMATS.OPENAI, parsed, state);
+    if (translated?.length) chunks.push(...translated);
   }
 
+  return buildOpenAIResponseFromChunks(chunks, fallbackModel);
+}
+
+function buildOpenAIResponseFromChunks(chunks, fallbackModel) {
   if (chunks.length === 0) return null;
 
   const first = chunks[0];
@@ -102,7 +123,7 @@ export function parseSSEToOpenAIResponse(rawSSE, fallbackModel) {
  * Handle case: provider forced streaming but client wants JSON.
  * Supports both Codex/Responses API SSE and standard Chat Completions SSE.
  */
-export async function handleForcedSSEToJson({ providerResponse, sourceFormat, provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, trackDone, appendLog, reqTag, log }) {
+export async function handleForcedSSEToJson({ providerResponse, sourceFormat, targetFormat, provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, trackDone, appendLog, reqTag, log }) {
   const contentType = providerResponse.headers.get("content-type") || "";
   const isSSE = contentType.includes("text/event-stream") || (contentType === "" && isResponsesProvider(provider));
   if (!isSSE) return null; // not handled here
@@ -194,7 +215,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, pr
   // Standard Chat Completions SSE path
   try {
     const sseText = await providerResponse.text();
-    const parsed = parseSSEToOpenAIResponse(sseText, model);
+    const parsed = parseSSEToOpenAIResponse(sseText, model, targetFormat);
     if (!parsed) return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Invalid SSE response for non-streaming request");
 
     if (onRequestSuccess) await onRequestSuccess();

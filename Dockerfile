@@ -42,6 +42,12 @@ RUN mkdir -p /app/data && chown -R node:node /app && \
   mkdir -p /app/data-home && chown node:node /app/data-home && \
   ln -sf /app/data-home /root/.9router 2>/dev/null || true
 
+# Claude CLI, for the "claude-cli" provider (open-sse/executors/claude-cli.js), which
+# shells out to `claude -p` instead of calling the Anthropic API over HTTP. gcompat is
+# needed because the CLI ships prebuilt native helper binaries linked against glibc,
+# which alpine's musl libc doesn't provide natively.
+RUN apk --no-cache add gcompat && npm install -g @anthropic-ai/claude-code
+
 # Fix permissions at runtime (handles mounted volumes)
 RUN apk --no-cache upgrade && apk --no-cache add su-exec && \
   printf '#!/bin/sh\nchown -R node:node /app/data /app/data-home 2>/dev/null\nexec su-exec node "$@"\n' > /entrypoint.sh && \
