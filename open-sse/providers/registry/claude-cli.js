@@ -5,8 +5,8 @@
 export default {
   id: "claude-cli",
   priority: 10,
-  alias: "cli",
-  uiAlias: "cli",
+  alias: "ccli",
+  uiAlias: "ccli",
   display: {
     name: "Claude Code CLI",
     icon: "smart_toy",
