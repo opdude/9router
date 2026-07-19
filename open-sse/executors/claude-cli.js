@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
+import { randomUUID, createHash } from "node:crypto";
 import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
 import { SSE_HEADERS, SSE_DONE } from "../utils/sseConstants.js";
@@ -16,6 +17,33 @@ const AUTH_ERROR_PATTERN = /not logged in|please run \/login|authentication fail
 const QUOTA_ERROR_PATTERN = /usage limit reached|credit balance (?:is )?too low/i;
 
 const CLAUDE_BIN = process.env.CLAUDE_CLI_PATH || "claude";
+
+// Each `claude -p` call is otherwise a brand-new process with no server-side history,
+// so a growing conversation gets re-sent as one giant transcript every single turn —
+// full token cost, no prompt caching, every time. `claude` supports resuming a prior
+// print-mode session by UUID (--session-id / --resume), which keeps real Claude-side
+// history (and its native caching) alive across turns. 9Router's request shape has no
+// session concept though (client just resends the full message array each call), so we
+// fake one: hash the transcript of "everything except the newest message" and use that
+// as a lookup key for the session UUID we'd expect to resume. In-memory only — losing
+// this map just means the next turn falls back to a fresh session, never a hard failure.
+const SESSION_TTL_MS = 30 * 60 * 1000;
+const sessionCache = new Map(); // `${model}:${transcriptHash}` -> { sessionId, expiresAt }
+
+function pruneSessionCache() {
+  const now = Date.now();
+  for (const [key, entry] of sessionCache) {
+    if (entry.expiresAt <= now) sessionCache.delete(key);
+  }
+}
+
+function transcriptHash(messages) {
+  return createHash("sha256").update(buildTranscript(messages)).digest("hex");
+}
+
+function sessionCacheKey(model, messages) {
+  return `${model}:${transcriptHash(messages)}`;
+}
 
 // Flatten an Anthropic content value (string, or array of content blocks) down to
 // plain text — `claude -p` takes a single natural-language prompt, not structured
@@ -58,19 +86,26 @@ function buildTranscript(messages = []) {
 // fixes this; the caller's own system message (if any) is appended after our baseline.
 const BASE_SYSTEM_PROMPT = "You are a helpful assistant. Answer directly and concisely. You have no tools available in this session — do not attempt, narrate, or simulate any tool calls.";
 
-function buildArgs(model, body) {
+function buildSystemPrompt(body) {
+  const callerSystem = flattenContent(body.system);
+  return callerSystem ? `${BASE_SYSTEM_PROMPT}\n\n${callerSystem}` : BASE_SYSTEM_PROMPT;
+}
+
+// `session` is `{ mode: "fresh", id }` (brand-new session, persisted under `id` for a
+// future resume) or `{ mode: "resume", id }` (continue an existing session — no tool
+// access here either, since --tools is fixed per-invocation regardless of session history).
+function buildArgs(model, system, session) {
   const args = [
     "-p", "--output-format", "stream-json", "--include-partial-messages", "--verbose",
     "--model", model,
-    // No tool access and no persisted session/state for a stateless API call — this
-    // executor is a text-completion backend, not an agentic coding session.
+    // No tool access for a stateless API call — this executor is a text-completion
+    // backend, not an agentic coding session. (Persistence itself IS wanted now, so a
+    // later turn can --resume instead of re-sending the whole transcript.)
     "--tools", "",
-    "--no-session-persistence",
     "--setting-sources", "user",
+    "--system-prompt", system,
   ];
-  const callerSystem = flattenContent(body.system);
-  const system = callerSystem ? `${BASE_SYSTEM_PROMPT}\n\n${callerSystem}` : BASE_SYSTEM_PROMPT;
-  args.push("--system-prompt", system);
+  args.push(session.mode === "resume" ? "--resume" : "--session-id", session.id);
   return args;
 }
 
@@ -86,6 +121,14 @@ function emitLine(line, controller, encoder, state) {
   try { parsed = JSON.parse(trimmed); } catch { return; }
 
   if (parsed.type === "stream_event" && parsed.event) {
+    if (parsed.event.type === "message_start") state.sawMessageStart = true;
+    // Accumulate the final assistant text (ignoring thinking-block deltas) so it can be
+    // appended to the transcript hash a client is expected to resend next turn — see
+    // sessionCache above. Mirrors what an OpenAI-style client actually echoes back: plain
+    // text content, not thinking blocks.
+    if (parsed.event.type === "content_block_delta" && parsed.event.delta?.type === "text_delta") {
+      state.assembledText = (state.assembledText || "") + (parsed.event.delta.text || "");
+    }
     controller.enqueue(encoder.encode(`data: ${JSON.stringify(parsed.event)}\n\n`));
     return;
   }
@@ -100,7 +143,7 @@ function emitLine(line, controller, encoder, state) {
     controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: {} })}\n\n`));
     controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "message_stop" })}\n\n`));
   }
-  if (parsed.type === "stream_event" && parsed.event?.type === "message_start") state.sawMessageStart = true;
+  if (parsed.type === "result" && parsed.is_error) state.hadError = true;
 }
 
 export class ClaudeCliExecutor extends BaseExecutor {
@@ -118,12 +161,11 @@ export class ClaudeCliExecutor extends BaseExecutor {
     return { status: response.status, message: bodyText || `HTTP ${response.status}` };
   }
 
-  // Fully overridden — this provider shells out to a local CLI process instead of
-  // making an HTTP call, so none of BaseExecutor's fetch/retry/fallback machinery applies.
-  async execute({ model, body, signal, log }) {
-    const args = buildArgs(model, body);
-    const prompt = buildTranscript(body.messages);
-
+  // Spawns one `claude` process for the given args/stdin and resolves once we know
+  // whether it actually started a turn (stream_event) or failed outright (is_error / no
+  // output at all) — split out so execute() can retry once with a fresh session if a
+  // --resume attempt turns out to be pointing at a session that no longer exists.
+  async runOnce(args, prompt, signal) {
     const child = spawn(CLAUDE_BIN, args, {
       // Neutral cwd so per-repo CLAUDE.md/skills don't leak into every API response.
       cwd: tmpdir(),
@@ -143,9 +185,6 @@ export class ClaudeCliExecutor extends BaseExecutor {
 
     const onAbort = () => { try { child.kill("SIGTERM"); } catch {} };
     signal?.addEventListener("abort", onAbort, { once: true });
-
-    const encoder = new TextEncoder();
-    const state = { model, sawMessageStart: false };
 
     // Don't commit to a response (and therefore an HTTP status) until we know whether
     // the CLI actually started a turn or failed outright (e.g. "Not logged in" with no
@@ -186,6 +225,38 @@ export class ClaudeCliExecutor extends BaseExecutor {
       child.once("error", (err) => settle({ ok: false, message: err.message || "claude CLI process error" }));
     });
 
+    return { child, outcome, pendingLines, onAbort, stderrBuf: () => stderrBuf };
+  }
+
+  // Fully overridden — this provider shells out to a local CLI process instead of
+  // making an HTTP call, so none of BaseExecutor's fetch/retry/fallback machinery applies.
+  async execute({ model, body, signal, log }) {
+    const system = buildSystemPrompt(body);
+    const messages = body.messages || [];
+    const priorMessages = messages.slice(0, -1);
+    const lastMessage = messages[messages.length - 1];
+
+    pruneSessionCache();
+    const cached = messages.length >= 2 && lastMessage?.role === "user"
+      ? sessionCache.get(sessionCacheKey(model, priorMessages))
+      : undefined;
+
+    let session = cached ? { mode: "resume", id: cached.sessionId } : { mode: "fresh", id: randomUUID() };
+    let prompt = cached ? flattenContent(lastMessage.content) : buildTranscript(messages);
+    let args = buildArgs(model, system, session);
+    let { child, outcome, pendingLines, onAbort, stderrBuf: getStderr } = await this.runOnce(args, prompt, signal);
+
+    // A cached session may no longer exist on Claude's side (pruned, restarted, etc).
+    // Fail open: retry once as a brand-new session with the full transcript rather than
+    // surfacing a resume-specific error or (worse) falling back to the next combo model
+    // for what is otherwise a perfectly healthy provider.
+    if (!outcome.ok && session.mode === "resume") {
+      session = { mode: "fresh", id: randomUUID() };
+      prompt = buildTranscript(messages);
+      args = buildArgs(model, system, session);
+      ({ child, outcome, pendingLines, onAbort, stderrBuf: getStderr } = await this.runOnce(args, prompt, signal));
+    }
+
     if (!outcome.ok) {
       onAbort();
       const status = QUOTA_ERROR_PATTERN.test(outcome.message)
@@ -200,6 +271,10 @@ export class ClaudeCliExecutor extends BaseExecutor {
       return { response, url: "claude-cli://local", headers: {}, transformedBody: body };
     }
 
+    const encoder = new TextEncoder();
+    const state = { model, sawMessageStart: false, assembledText: "", hadError: false };
+    let rawBuffer = "";
+
     const body_ = new ReadableStream({
       start(controller) {
         for (const line of pendingLines) emitLine(line, controller, encoder, state);
@@ -213,6 +288,17 @@ export class ClaudeCliExecutor extends BaseExecutor {
           if (rawBuffer.trim()) emitLine(rawBuffer, controller, encoder, state);
           controller.enqueue(encoder.encode(SSE_DONE));
           controller.close();
+          // Record where this conversation ended up so a future turn — whose "everything
+          // except the newest message" matches what we expect the client to resend
+          // (this turn's messages plus the assistant reply just generated) — can
+          // --resume this exact session instead of re-sending the whole transcript.
+          if (!state.hadError) {
+            const nextPrefix = [...messages, { role: "assistant", content: state.assembledText }];
+            sessionCache.set(sessionCacheKey(model, nextPrefix), {
+              sessionId: session.id,
+              expiresAt: Date.now() + SESSION_TTL_MS,
+            });
+          }
         });
         child.stdout.on("error", err => controller.error(err));
         child.once("error", err => controller.error(err));
@@ -222,7 +308,7 @@ export class ClaudeCliExecutor extends BaseExecutor {
 
     if (log?.debug) {
       child.once("exit", (code) => {
-        if (code !== 0) log.debug("CLAUDE-CLI", `exited ${code}${stderrBuf ? `: ${stderrBuf.slice(0, 300)}` : ""}`);
+        if (code !== 0) log.debug("CLAUDE-CLI", `exited ${code}${getStderr() ? `: ${getStderr().slice(0, 300)}` : ""}`);
       });
     }
 
