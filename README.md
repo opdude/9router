@@ -1216,11 +1216,13 @@ docker pull decolua/9router:latest   # update to latest
 
 **Data persistence:** `$HOME/.9router/db/data.sqlite` on host ↔ `/app/data/db/data.sqlite` in container.
 
-**Optional: Claude Code CLI provider.** To use the `claude-cli` provider (routes requests through a `claude` CLI session running inside the container instead of an API key), log in inside the running container as a dedicated session — don't share credentials from a host/laptop `claude` session you also use interactively (Anthropic rotates the OAuth refresh token on every use, so two processes sharing one session will periodically invalidate each other's token):
+**Optional: Claude Code CLI provider.** To use the `claude-cli` provider (routes requests through a `claude` CLI session running inside the container instead of an API key), log in inside the running container as a dedicated session — don't reuse a `claude` session from your host or laptop:
 
 ```bash
 docker exec -it 9router claude auth login
 ```
+
+To keep that login across image updates/container recreation, mount a volume at `/home/node/.claude`: add `-v 9router-claude:/home/node/.claude` to `docker run`, or a `9router-claude:/home/node/.claude` entry under `volumes:` in `docker-compose.yml`.
 
 Not needed for any other provider — skip this if you don't use `claude-cli`.
 
