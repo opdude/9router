@@ -1228,6 +1228,20 @@ docker run -d --name 9router -p 20128:20128 \
 
 Not needed for any other provider — skip this mount and env var entirely if you don't use `claude-cli`. On SELinux-enforcing hosts (Fedora/RHEL family), add the `:z` mount flag (`-v "$HOME/.claude:/home/node/.claude:z"`) or the bind mount will be silently denied regardless of file permissions.
 
+**Re-authenticating claude-cli inside a running container:** if you need to run `claude auth login` directly against an already-running container (e.g. no bind-mounted `~/.claude`, or fixing an expired session in place), always target the `node` user explicitly:
+
+```bash
+docker exec -it -u node 9router claude auth login
+```
+
+`docker exec` defaults to **root** unless `-u node` is given. The gateway process itself always runs as `node`, so a login done as root writes `~/.claude/.credentials.json` owned by `root:root` (mode `0600`) — unreadable by the actual server process. This doesn't error loudly: `claude auth status` as root will happily report a valid login, while the executor (running as `node`) keeps failing every request with "Not logged in" and 401s falling back to the next model in the combo, because it can't read the file at all. If you already ran the login as root by mistake, you don't need to redo it — just fix ownership:
+
+```bash
+docker exec 9router chown node:node /home/node/.claude/.credentials.json
+```
+
+Also worth knowing: if the container's Claude session is a copy of a session you also use interactively on another machine (e.g. your laptop's `claude` CLI), the two will periodically invalidate each other — Anthropic rotates the OAuth refresh token on every use, so whichever side refreshes last blanks out the other's stored token, surfacing as "OAuth session expired and could not be refreshed" even though the account itself is fine. Prefer a dedicated credential for the container instead of sharing your daily-driver session: run `claude setup-token` (produces a long-lived token independent of any interactive session) and set it as `CLAUDE_CODE_OAUTH_TOKEN` in the container's environment — the CLI reads it directly, no bind-mounted `~/.claude` needed.
+
 ### Environment Variables
 
 | Variable                                             | Default                                  | Description                                                                         |
