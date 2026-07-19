@@ -10,7 +10,7 @@ import { HTTP_STATUS } from "../config/runtimeConfig.js";
 // treats these the same as any other provider's auth/quota failure (see chatCore.js's
 // `!providerResponse.ok` branch), instead of silently swallowing them into a 200
 // response with the error baked into the assistant's reply text.
-const AUTH_ERROR_PATTERN = /not logged in|please run \/login|authentication failed|invalid api key|oauth token (?:expired|revoked)|401 unauthorized|403 forbidden|token (?:has )?expired|bad credentials/i;
+const AUTH_ERROR_PATTERN = /not logged in|please run \/login|authentication failed|failed to authenticate|invalid api key|oauth (?:token|session) (?:expired|revoked)|401 unauthorized|403 forbidden|token (?:has )?expired|bad credentials/i;
 // Quota/billing exhaustion — distinct from auth so it maps to 429 (rate limited) rather
 // than 401, giving it accountFallback's backoff/retry-after handling instead of a flat lock.
 const QUOTA_ERROR_PATTERN = /usage limit reached|credit balance (?:is )?too low/i;
