@@ -25,6 +25,11 @@ ENV PORT=20128
 ENV HOSTNAME=0.0.0.0
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV DATA_DIR=/app/data
+# Forces `claude auth login` (and the executor's own spawned `claude -p` calls) to the
+# same config dir regardless of which user runs `docker exec` — otherwise a root exec
+# session (HOME=/root, the docker exec default) writes credentials to /root/.claude,
+# a location the gateway process (always running as `node`) never reads.
+ENV CLAUDE_CONFIG_DIR=/home/node/.claude
 
 COPY --from=builder /app/public ./public
 COPY --from=builder /app/.next/static ./.next/static
@@ -50,7 +55,7 @@ RUN apk --no-cache add gcompat && npm install -g @anthropic-ai/claude-code
 
 # Fix permissions at runtime (handles mounted volumes)
 RUN apk --no-cache upgrade && apk --no-cache add su-exec && \
-  printf '#!/bin/sh\nchown -R node:node /app/data /app/data-home 2>/dev/null\nexec su-exec node "$@"\n' > /entrypoint.sh && \
+  printf '#!/bin/sh\nchown -R node:node /app/data /app/data-home /home/node/.claude 2>/dev/null\nexec su-exec node "$@"\n' > /entrypoint.sh && \
   chmod +x /entrypoint.sh
 
 EXPOSE 20128

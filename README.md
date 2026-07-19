@@ -1216,19 +1216,13 @@ docker pull decolua/9router:latest   # update to latest
 
 **Data persistence:** `$HOME/.9router/db/data.sqlite` on host ↔ `/app/data/db/data.sqlite` in container.
 
-**Optional: Claude Code CLI provider.** To use the `claude-cli` provider (routes requests through a `claude` CLI session running inside the container instead of an API key), log in **inside the running container** as a dedicated session — don't bind-mount or otherwise share credentials from a host/laptop `claude` session you also use interactively. Anthropic rotates the OAuth refresh token on every use, so two independent processes sharing one session will periodically invalidate each other's stored token (surfaces as "OAuth session expired and could not be refreshed" even though the account itself is fine). A container-local login avoids that entirely:
+**Optional: Claude Code CLI provider.** To use the `claude-cli` provider (routes requests through a `claude` CLI session running inside the container instead of an API key), log in inside the running container as a dedicated session — don't share credentials from a host/laptop `claude` session you also use interactively (Anthropic rotates the OAuth refresh token on every use, so two processes sharing one session will periodically invalidate each other's token):
 
 ```bash
-docker exec -it -u node 9router claude auth login
+docker exec -it 9router claude auth login
 ```
 
-Always include `-u node`. `docker exec` defaults to **root** unless told otherwise, but the gateway process itself always runs as `node`. A login done as root writes `~/.claude/.credentials.json` owned by `root:root` (mode `0600`) — unreadable by the actual server process. This doesn't error loudly: `claude auth status` as root will happily report a valid login, while the executor (running as `node`) keeps failing every request with "Not logged in" and 401s falling back to the next model in the combo, because it can't read the file at all. If you already ran the login as root by mistake, you don't need to redo it — just fix ownership:
-
-```bash
-docker exec 9router chown node:node /home/node/.claude/.credentials.json
-```
-
-Not needed for any other provider — skip all of this if you don't use `claude-cli`.
+Not needed for any other provider — skip this if you don't use `claude-cli`.
 
 ### Environment Variables
 
