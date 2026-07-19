@@ -304,8 +304,15 @@ function buildQueryOptions(model, tools, mcp, signal, resume, systemPrompt) {
     ];
   }
 
+  // Always create our own AbortController (not just when `signal` is given) so
+  // callers — notably streamFromIterator's ReadableStream.cancel() — have a
+  // direct handle to kill the in-flight SDK query. Without this, a client
+  // that disconnects/retries (Hermes does this aggressively, giving up on a
+  // stream after ~1-2s) leaves the abandoned generation running server-side
+  // for however long the model takes (observed: full STREAM_STALL_TIMEOUT_MS,
+  // burning real API cost) instead of being killed immediately.
+  opts.abortController = new AbortController();
   if (signal) {
-    opts.abortController = new AbortController();
     signal.addEventListener("abort", () => opts.abortController.abort(), {
       once: true,
     });
@@ -381,6 +388,7 @@ export class ClaudeCliExecutor extends BaseExecutor {
           messages,
           signal,
           log,
+          pending.abortController,
         );
       }
       log?.debug?.(
@@ -447,6 +455,7 @@ export class ClaudeCliExecutor extends BaseExecutor {
       system,
       signal,
       log,
+      opts.abortController,
     );
   }
 
@@ -466,6 +475,7 @@ export class ClaudeCliExecutor extends BaseExecutor {
     system,
     signal,
     log,
+    abortController,
   ) {
     const handlerQueue = mcp?.handlerQueue || [];
     const toolUses = [];
@@ -589,6 +599,7 @@ export class ClaudeCliExecutor extends BaseExecutor {
                   iterator: currentIterator,
                   resolveHandlers,
                   createdAt: Date.now(),
+                  abortController,
                 });
 
                 controller.enqueue(encoder.encode(SSE_DONE));
@@ -637,6 +648,7 @@ export class ClaudeCliExecutor extends BaseExecutor {
                       prompt: messageStream(collapseForFreshQuery(messages)),
                       options: freshOpts,
                     });
+                    abortController = freshOpts.abortController;
                     continue;
                   } catch {
                     /* fall through to error surfacing below */
@@ -700,7 +712,13 @@ export class ClaudeCliExecutor extends BaseExecutor {
       },
 
       cancel() {
+        // Setting doneStreaming alone does nothing while the loop is parked on
+        // `await currentIterator.next()` — that await only settles when the
+        // SDK call itself finishes, which can take minutes. Abort it directly
+        // so a disconnected/retried-away client doesn't leave the generation
+        // running (and billing) in the background.
         doneStreaming = true;
+        abortController?.abort();
       },
     });
 
@@ -724,6 +742,7 @@ export class ClaudeCliExecutor extends BaseExecutor {
     messages,
     signal,
     log,
+    abortController,
   ) {
     // Match tool results to handlers by tool_use_id
     for (const tr of toolResults) {
@@ -806,6 +825,12 @@ export class ClaudeCliExecutor extends BaseExecutor {
           }
         }
       },
+
+      cancel() {
+        // Same reasoning as streamFromIterator's cancel(): a disconnected
+        // client must not leave the continuation running unbounded.
+        abortController?.abort();
+      },
     });
 
     return {
@@ -837,6 +862,7 @@ export class ClaudeCliExecutor extends BaseExecutor {
         for (const rh of s.resolveHandlers) {
           rh.reject?.(new Error("[tool timeout — session expired]"));
         }
+        s.abortController?.abort();
         this.pendingSessions.delete(k);
       }
     }
