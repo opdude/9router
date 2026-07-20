@@ -2,16 +2,42 @@
  * Claude Code CLI executor — wraps @anthropic-ai/claude-agent-sdk instead of
  * spawning `claude -p`.  Supports:
  *   - Streaming chat with SDK-native session resume
- *   - Client-side tool calling via in-process MCP server + blocking handlers.
- *     Caller's `tools[]` schemas are registered as raw-JSON-Schema MCP tools
- *     whose handlers block on deferred promises.  When the model emits
- *     `tool_use`, we return `finish_reason: "tool_calls"` to the HTTP client,
- *     close the SSE stream, and park the still-alive SDK iterator.  Next HTTP
- *     request delivers `role:"tool"` results, resolves pending handlers, and
- *     continues draining the same iterator — Claude session stays alive across
- *     HTTP requests with prompt cache intact.
+ *   - Client-side tool calling via in-process MCP server.
  *
- * Pattern: meridian (https://github.com/rynfar/meridian).
+ * Tool calling design (important — this replaced an earlier, badly broken
+ * approach): the in-process "sdk"-type MCP server's CallToolRequest handler
+ * resolves IMMEDIATELY with a throwaway placeholder — it does NOT block
+ * waiting for the real client-side tool result. An earlier version had it
+ * block on a deferred promise (only resolved once the HTTP client's real
+ * answer arrived), on the theory that we'd see the model's `tool_use` content
+ * block and pause/return to the client before the SDK ever tried to actually
+ * resolve the call. That assumption was wrong: confirmed by live
+ * reproduction, the SDK dispatches the MCP CallToolRequest and blocks waiting
+ * on it *before* it ever yields the completed assistant message to our
+ * consuming code — so a never-resolving handler forced the SDK to eat its own
+ * internal `MCP_TOOL_TIMEOUT` (5 min) on *every single tool call*, regardless
+ * of `maxTurns`. Real production turns were measured taking ~930s (≈3 tool
+ * calls × 5 min) and ~40 min (≈8 tool calls × 5 min) — not model "thinking
+ * time" at all.
+ *
+ * The fix: `maxTurns` is always 1, so the SDK can't try to actually act on
+ * the (fake) tool result — it hits the max-turns ceiling immediately after
+ * one turn and reports the tool call via `result.subtype ===
+ * "error_max_turns"` / `result.stop_reason === "tool_use"` (NOT a clean
+ * `stop_reason: "tool_use"` on the assistant message — the max-turns cutoff
+ * leaves that blank). We treat that pattern as the real tool-use signal,
+ * capture the SDK's `session_id`, and return `finish_reason: "tool_calls"` to
+ * the HTTP client — this whole round trip is now ~3s instead of 5+ minutes.
+ * When the client's real tool result arrives on the next request, we start a
+ * *new* `query({ resume: sessionId, ... })` seeded with a `tool_result`
+ * message — the SDK's native session-resume mechanism — rather than
+ * continuing a parked iterator. This also fixes chained tool_use (a second
+ * tool call in the continuation just re-enters the same pause/resume path;
+ * the old design explicitly did not support this).
+ *
+ * Loosely descended from the meridian pattern (https://github.com/rynfar/meridian),
+ * which parks a live iterator across HTTP requests — that part of the
+ * approach is what caused the bug above and is no longer used here.
  */
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -33,6 +59,9 @@ const SSE_HEADERS = {
   "X-Accel-Buffering": "no",
 };
 
+// The MCP handler now resolves instantly (see the file-level comment), so
+// this should never actually be hit — kept only as a defensive upper bound
+// passed to the CLI subprocess via MCP_TOOL_TIMEOUT.
 const TOOL_TIMEOUT_MS = 5 * 60 * 1000;
 const SESSION_TTL_MS = 30 * 60 * 1000;
 // Some real client stacks (observed: Hermes' OpenAI-SDK-based client) judge a
@@ -217,7 +246,6 @@ function buildMcpServer(tools) {
     return na.localeCompare(nb);
   });
 
-  const handlerQueue = [];
   const aliasToOriginal = new Map();
 
   const server = new Server(
@@ -239,18 +267,15 @@ function buildMcpServer(tools) {
     }),
   }));
 
-  server.setRequestHandler(CallToolRequestSchema, async (req) => {
-    return new Promise((resolve, reject) => {
-      handlerQueue.push({
-        name: req.params.name,
-        args: req.params.arguments,
-        resolve,
-        reject,
-      });
-    });
-  });
+  // Resolve immediately with a throwaway placeholder — see the file-level
+  // comment for why this must never block on the real client-side result.
+  // maxTurns:1 stops the SDK from doing anything further with this fake
+  // content; the real result is delivered later via a resumed session.
+  server.setRequestHandler(CallToolRequestSchema, async () => ({
+    content: [{ type: "text", text: "" }],
+  }));
 
-  return { server, handlerQueue, aliasToOriginal };
+  return { server, aliasToOriginal };
 }
 
 // ---------------------------------------------------------------------------
@@ -285,7 +310,10 @@ function buildQueryOptions(model, tools, mcp, signal, resume, systemPrompt) {
     includePartialMessages: true,
     permissionMode: "bypassPermissions",
     allowDangerouslySkipPermissions: true,
-    maxTurns: tools.length > 0 ? 10 : 1,
+    // Always 1 — see the file-level comment. Anything higher lets the SDK
+    // try to act on the MCP handler's fake tool result internally, which is
+    // exactly the bug this design avoids.
+    maxTurns: 1,
     env: {
       CLAUDE_AGENT_SDK_MCP_NO_PREFIX: "1",
       MCP_TOOL_TIMEOUT: String(TOOL_TIMEOUT_MS),
@@ -389,15 +417,15 @@ export class ClaudeCliExecutor extends BaseExecutor {
       const pending = this.pendingSessions.get(key);
       if (pending) {
         this.pendingSessions.delete(key);
-        return this.continueAfterTools(
-          pending.iterator,
-          pending.resolveHandlers,
+        return this.resumeWithToolResults(
+          pending.sessionId,
           toolResults,
           model,
           messages,
+          tools,
+          system,
           signal,
           log,
-          pending.abortController,
         );
       }
       log?.debug?.(
@@ -486,10 +514,7 @@ export class ClaudeCliExecutor extends BaseExecutor {
     log,
     abortController,
   ) {
-    const handlerQueue = mcp?.handlerQueue || [];
     const toolUses = [];
-    const resolveHandlers = [];
-    let handlerIdx = 0;
     let sawMessageStart = false;
     let sawAnyStreamEvent = false;
     let doneStreaming = false;
@@ -535,18 +560,6 @@ export class ClaudeCliExecutor extends BaseExecutor {
                 );
                 if (original) ev.content_block.name = original;
 
-                // MCP handlers fire in the order tool_use blocks appear.
-                // Match them positionally (meridian does the same).
-                const h =
-                  handlerIdx < handlerQueue.length
-                    ? handlerQueue[handlerIdx++]
-                    : null;
-                resolveHandlers.push({
-                  id: ev.content_block.id,
-                  name: ev.content_block.name,
-                  resolve: h?.resolve,
-                  reject: h?.reject,
-                });
                 toolUses.push({
                   id: ev.content_block.id,
                   name: ev.content_block.name,
@@ -609,14 +622,15 @@ export class ClaudeCliExecutor extends BaseExecutor {
                 }
               }
 
-              // ---- PAUSE: tool_use, park the iterator ----
+              // ---- PAUSE: tool_use ----
+              // Defensive fallback — in practice, with maxTurns:1 (see
+              // file-level comment) the SDK reports this via the terminal
+              // `result` message instead, not a clean stop_reason here.
               if (stopReason === "tool_use" && toolUses.length > 0) {
                 const key = fingerprint(model, messages);
                 this.pendingSessions.set(key, {
-                  iterator: currentIterator,
-                  resolveHandlers,
+                  sessionId: msg.session_id,
                   createdAt: Date.now(),
-                  abortController,
                 });
 
                 controller.enqueue(encoder.encode(SSE_DONE));
@@ -636,6 +650,26 @@ export class ClaudeCliExecutor extends BaseExecutor {
 
             // --- result (terminal) ---
             if (msg.type === "result") {
+              // ---- PAUSE: tool_use ----
+              // With maxTurns:1, the SDK can't act on the MCP handler's fake
+              // result — it hits the turn ceiling immediately and reports the
+              // tool call here (subtype "error_max_turns", stop_reason
+              // "tool_use") rather than as a clean stop_reason on the
+              // assistant message. This is the expected/normal path, not an
+              // error — a real client-side tool result is delivered next via
+              // a resumed session (see resumeWithToolResults).
+              if (toolUses.length > 0) {
+                const key = fingerprint(model, messages);
+                this.pendingSessions.set(key, {
+                  sessionId: msg.session_id,
+                  createdAt: Date.now(),
+                });
+
+                controller.enqueue(encoder.encode(SSE_DONE));
+                controller.close();
+                return;
+              }
+
               // The CLI sometimes returns a canned refusal (billing/quota walls,
               // e.g. "API Error: 400 Third-party apps now draw from your extra
               // usage...") as a *complete* assistant message with no preceding
@@ -751,125 +785,69 @@ export class ClaudeCliExecutor extends BaseExecutor {
   }
 
   // -------------------------------------------------------------------
-  // continueAfterTools — resolve handlers with client tool results,
-  // then continue streaming from the same iterator.
+  // resumeWithToolResults — start a *new* SDK query resuming the paused
+  // session by UUID, seeded with the client's real tool result as the next
+  // turn. Streams via the same streamFromIterator as any other query, so a
+  // chained tool_use in the continuation just re-parks — no special-casing
+  // needed (the old iterator-parking design couldn't do this).
+  //
+  // Delivered as plain text, NOT a `tool_result` content block matched by
+  // tool_use_id — confirmed by live testing that the latter does not work:
+  // the MCP handler's placeholder response (see buildMcpServer) already got
+  // recorded as *the* answer to that tool_use_id in the session's resumed
+  // history during the paused turn, so a second tool_result for the same id
+  // is ignored and the model answers from the (empty) placeholder instead.
+  // Telling it in prose to disregard the placeholder and use the real result
+  // works reliably.
   // -------------------------------------------------------------------
-  async continueAfterTools(
-    iterator,
-    resolveHandlers,
+  async resumeWithToolResults(
+    sessionId,
     toolResults,
     model,
     messages,
+    tools,
+    system,
     signal,
     log,
-    abortController,
   ) {
-    // Match tool results to handlers by tool_use_id
-    for (const tr of toolResults) {
-      const rh = resolveHandlers.find((h) => h.id === tr.tool_call_id);
-      if (rh?.resolve) {
-        const content = Array.isArray(tr.content)
-          ? tr.content
-          : [{ type: "text", text: String(tr.content || "") }];
-        rh.resolve({ content });
-      } else {
-        log?.debug?.(
-          "CLAUDE-SDK",
-          `no handler for tool_call_id ${tr.tool_call_id}`,
+    const resultText = toolResults
+      .map((tr) => {
+        const content = aliasReservedNamesDeep(
+          Array.isArray(tr.content)
+            ? tr.content
+            : [{ type: "text", text: String(tr.content || "") }],
         );
-      }
+        return `[Real result for tool_use_id ${tr.tool_call_id} — the MCP transport returned an empty placeholder for this call, ignore that and use this instead]:\n${flattenContent(content)}`;
+      })
+      .join("\n\n");
+
+    const mcp = buildMcpServer(tools);
+    const aliasedSystem = aliasReservedNamesInText(system);
+    const opts = buildQueryOptions(model, tools, mcp, signal, sessionId, aliasedSystem);
+
+    let q;
+    try {
+      q = query({
+        prompt: messageStream([{ role: "user", content: resultText }]),
+        options: opts,
+      });
+    } catch (err) {
+      log?.error?.("CLAUDE-SDK", `resume query() threw: ${err.message}`);
+      return this.errorResult(502, `claude-cli: SDK resume failed — ${err.message}`);
     }
 
-    // Now pull the continuation from the (now-unblocked) iterator.
-    // No handler queue — this is purely a streaming output phase.
-    let sawAnyEvent = false;
-    let keepAliveTimer = null;
-
-    const stream = new ReadableStream({
-      start: async (controller) => {
-        keepAliveTimer = setInterval(() => {
-          try {
-            controller.enqueue(KEEPALIVE_BYTES);
-          } catch {
-            /* controller already closed */
-          }
-        }, KEEPALIVE_INTERVAL_MS);
-        try {
-          while (true) {
-            const { value: msg, done } = await iterator.next();
-            if (done) break;
-
-            if (msg.type === "stream_event" && msg.event) {
-              sawAnyEvent = true;
-              controller.enqueue(encodeSSE(msg.event));
-            }
-
-            if (msg.type === "assistant") {
-              const sr = msg.message?.stop_reason;
-              if (sr === "end_turn" || !sr || sr === "stop_sequence") {
-                this.cacheTextSession(fingerprint(model, messages), msg.session_id);
-              }
-
-              // If more tool_use in the continuation, we'd need to
-              // re-park.  For now (single tool-use chain) this is fine;
-              // multi-round tool chaining can be added when needed.
-              if (sr === "tool_use") {
-                log?.debug?.(
-                  "CLAUDE-SDK",
-                  "chained tool_use in continuation — not yet supported, ending turn",
-                );
-              }
-            }
-
-            if (msg.type === "result") {
-              if (msg.session_id) {
-                this.cacheTextSession(fingerprint(model, messages), msg.session_id);
-              }
-              break;
-            }
-          }
-          controller.enqueue(encoder.encode(SSE_DONE));
-          controller.close();
-        } catch (err) {
-          if (!sawAnyEvent) {
-            controller.error(err);
-          } else {
-            try {
-              controller.enqueue(
-                encodeSSE({
-                  type: "content_block_delta",
-                  index: 0,
-                  delta: {
-                    type: "text_delta",
-                    text: `[claude-cli error: ${err.message}]`,
-                  },
-                }),
-              );
-              controller.enqueue(encoder.encode(SSE_DONE));
-              controller.close();
-            } catch {
-              /* already closed */
-            }
-          }
-        } finally {
-          clearInterval(keepAliveTimer);
-        }
-      },
-
-      cancel() {
-        // Same reasoning as streamFromIterator's cancel(): a disconnected
-        // client must not leave the continuation running unbounded.
-        abortController?.abort();
-        clearInterval(keepAliveTimer);
-      },
-    });
-
-    return {
-      response: new Response(stream, { status: 200, headers: SSE_HEADERS }),
-      url: "claude-cli://local",
-      headers: SSE_HEADERS,
-      transformedBody: null,
-    };
+    return this.streamFromIterator(
+      q,
+      mcp,
+      model,
+      messages,
+      tools,
+      sessionId,
+      system,
+      signal,
+      log,
+      opts.abortController,
+    );
   }
 
   // -------------------------------------------------------------------
@@ -888,12 +866,11 @@ export class ClaudeCliExecutor extends BaseExecutor {
     for (const [k, s] of this.textSessions) {
       if (s.expiresAt <= now) this.textSessions.delete(k);
     }
+    // A paused session holds no live iterator/handler — resumeWithToolResults
+    // starts a brand-new query keyed off the cached sessionId — so pruning it
+    // is just dropping the cache entry, nothing to reject or abort.
     for (const [k, s] of this.pendingSessions) {
       if (now - s.createdAt > SESSION_TTL_MS) {
-        for (const rh of s.resolveHandlers) {
-          rh.reject?.(new Error("[tool timeout — session expired]"));
-        }
-        s.abortController?.abort();
         this.pendingSessions.delete(k);
       }
     }
