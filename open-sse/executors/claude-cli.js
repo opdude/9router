@@ -682,7 +682,18 @@ export class ClaudeCliExecutor extends BaseExecutor {
                 !sawAnyStreamEvent &&
                 typeof msg.result === "string" &&
                 msg.result.match(/^API Error: (\d+)\s*(.*)$/s);
-              const isErrorResult = msg.subtype !== "success" || Boolean(cliApiError);
+              // A rate-limit/quota rejection can ALSO come back as a genuinely
+              // empty `subtype:"success"` result with no text at all (confirmed
+              // live: production turns with IN 0/OUT 0, requestDetails showing
+              // "[Empty streaming response]", right after account quota ran
+              // out) — the SDK's own SDKResultSuccess type carries `is_error`
+              // and `api_error_status` fields independent of `subtype`, and we
+              // were only checking `subtype`. Treat `is_error: true` as a
+              // failure regardless of subtype so combo/account fallback sees it.
+              const isErrorResult =
+                msg.subtype !== "success" ||
+                Boolean(cliApiError) ||
+                msg.is_error === true;
 
               if (isErrorResult && !sawAnyStreamEvent) {
                 // A cached session id may no longer exist server-side (pruned,
@@ -708,10 +719,14 @@ export class ClaudeCliExecutor extends BaseExecutor {
 
                 const errMsg = cliApiError
                   ? cliApiError[2] || msg.result
-                  : msg.errors?.join?.(", ") || "SDK query failed";
+                  : msg.errors?.join?.(", ") ||
+                    (typeof msg.result === "string" && msg.result) ||
+                    "SDK query failed — empty result with is_error";
                 const status = cliApiError
                   ? Number(cliApiError[1])
-                  : classifyAssistantError(assistantError);
+                  : msg.api_error_status ||
+                    classifyAssistantError(assistantError) ||
+                    429;
                 log?.error?.("CLAUDE-SDK", `result error: ${errMsg}`);
                 if (status) {
                   controller.error({
