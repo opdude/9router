@@ -35,7 +35,16 @@ const SSE_HEADERS = {
 
 const TOOL_TIMEOUT_MS = 5 * 60 * 1000;
 const SESSION_TTL_MS = 30 * 60 * 1000;
+// Some real client stacks (observed: Hermes' OpenAI-SDK-based client) judge a
+// stream "empty" and bail/retry after as little as ~1-2s of total silence —
+// well inside a normal ttft for this executor, let alone a stretch where the
+// model is genuinely thinking with nothing yet to relay. An SSE comment line
+// (`: ...\n\n`) is invisible to any spec-compliant SSE/OpenAI-chunk parser but
+// still counts as upstream bytes, so a client's own stream-health timer (and
+// our STREAM_STALL_TIMEOUT_MS watchdog) both see the connection as alive.
+const KEEPALIVE_INTERVAL_MS = 1000;
 const encoder = new TextEncoder();
+const KEEPALIVE_BYTES = encoder.encode(": ka\n\n");
 const encodeSSE = (data) =>
   encoder.encode(`data: ${JSON.stringify(data)}\n\n`);
 
@@ -487,9 +496,17 @@ export class ClaudeCliExecutor extends BaseExecutor {
     let currentIterator = iterator;
     let retriedFresh = false;
     let assistantError = null;
+    let keepAliveTimer = null;
 
     const stream = new ReadableStream({
       start: async (controller) => {
+        keepAliveTimer = setInterval(() => {
+          try {
+            controller.enqueue(KEEPALIVE_BYTES);
+          } catch {
+            /* controller already closed */
+          }
+        }, KEEPALIVE_INTERVAL_MS);
         try {
           while (!doneStreaming) {
             const { value: msg, done } = await currentIterator.next();
@@ -708,6 +725,8 @@ export class ClaudeCliExecutor extends BaseExecutor {
               /* stream already closed */
             }
           }
+        } finally {
+          clearInterval(keepAliveTimer);
         }
       },
 
@@ -719,6 +738,7 @@ export class ClaudeCliExecutor extends BaseExecutor {
         // running (and billing) in the background.
         doneStreaming = true;
         abortController?.abort();
+        clearInterval(keepAliveTimer);
       },
     });
 
@@ -763,9 +783,17 @@ export class ClaudeCliExecutor extends BaseExecutor {
     // Now pull the continuation from the (now-unblocked) iterator.
     // No handler queue — this is purely a streaming output phase.
     let sawAnyEvent = false;
+    let keepAliveTimer = null;
 
     const stream = new ReadableStream({
       start: async (controller) => {
+        keepAliveTimer = setInterval(() => {
+          try {
+            controller.enqueue(KEEPALIVE_BYTES);
+          } catch {
+            /* controller already closed */
+          }
+        }, KEEPALIVE_INTERVAL_MS);
         try {
           while (true) {
             const { value: msg, done } = await iterator.next();
@@ -823,6 +851,8 @@ export class ClaudeCliExecutor extends BaseExecutor {
               /* already closed */
             }
           }
+        } finally {
+          clearInterval(keepAliveTimer);
         }
       },
 
@@ -830,6 +860,7 @@ export class ClaudeCliExecutor extends BaseExecutor {
         // Same reasoning as streamFromIterator's cancel(): a disconnected
         // client must not leave the continuation running unbounded.
         abortController?.abort();
+        clearInterval(keepAliveTimer);
       },
     });
 
