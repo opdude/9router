@@ -523,6 +523,88 @@ export class ClaudeCliExecutor extends BaseExecutor {
     let assistantError = null;
     let keepAliveTimer = null;
 
+    // ---- pre-flight peek ----
+    // chatCore/combo.js decide "did this model succeed?" purely from the
+    // Response status returned here — and previously we always returned 200
+    // synchronously, before the SDK had said anything at all. An immediate
+    // quota/session-limit rejection reports back as a terminal `result`
+    // message with `is_error`/a non-"success" subtype and zero preceding
+    // stream events, often within ~2-3s. If that happens AFTER we've already
+    // returned 200 and combo.js has logged "succeeded" and started piping
+    // bytes to the client, the error can only blow up the pipe
+    // ("failed to pipe response" — confirmed live, this even took the whole
+    // process down via an unhandled rejection) instead of letting
+    // combo/account fallback move to the next model. So pull at least one
+    // message ourselves first: if it's an immediate error, hand back a real
+    // error Response (same shape as any other failed executor) so the normal
+    // fallback path can do its job. Anything else gets buffered and replayed
+    // into the real stream below — this adds no latency for a real reply
+    // since the first content chunk was always going to take this same
+    // amount of time to arrive, we've just moved the wait earlier.
+    const preloaded = [];
+    peekLoop: while (true) {
+      let msg, done;
+      try {
+        ({ value: msg, done } = await currentIterator.next());
+      } catch (err) {
+        return this.errorResult(502, `claude-cli: SDK query failed — ${err.message}`);
+      }
+      if (done) break;
+
+      if (msg.type === "stream_event" || msg.type === "assistant") {
+        preloaded.push(msg);
+        break;
+      }
+
+      if (msg.type === "result") {
+        const cliApiError =
+          typeof msg.result === "string" &&
+          msg.result.match(/^API Error: (\d+)\s*(.*)$/s);
+        const isErrorResult =
+          msg.subtype !== "success" || Boolean(cliApiError) || msg.is_error === true;
+
+        if (isErrorResult) {
+          // Same fail-open retry as the main loop below: a cached session id
+          // may no longer exist server-side — retry once as a brand-new
+          // session before giving up.
+          if (resumeSessionId && !retriedFresh && !cliApiError) {
+            retriedFresh = true;
+            try {
+              const freshOpts = buildQueryOptions(model, tools, mcp, signal, null, system);
+              currentIterator = query({
+                prompt: messageStream(collapseForFreshQuery(messages)),
+                options: freshOpts,
+              });
+              abortController = freshOpts.abortController;
+              continue peekLoop;
+            } catch {
+              /* fall through to error surfacing below */
+            }
+          }
+
+          const errMsg = cliApiError
+            ? cliApiError[2] || msg.result
+            : msg.errors?.join?.(", ") ||
+              (typeof msg.result === "string" && msg.result) ||
+              "SDK query failed — empty result with is_error";
+          const status = cliApiError
+            ? Number(cliApiError[1])
+            : msg.api_error_status || 429;
+          log?.error?.("CLAUDE-SDK", `result error (pre-flight): ${errMsg}`);
+          return this.errorResult(status, `claude-cli: ${errMsg}`);
+        }
+
+        // Non-error terminal with no content (e.g. paused for tool_use
+        // before any output, or a genuinely empty successful reply) — not a
+        // failure, let the normal stream path below handle it identically.
+        preloaded.push(msg);
+        break;
+      }
+
+      // system/init or other non-content, non-terminal message types —
+      // nothing to replay, keep peeking.
+    }
+
     const stream = new ReadableStream({
       start: async (controller) => {
         keepAliveTimer = setInterval(() => {
@@ -534,7 +616,9 @@ export class ClaudeCliExecutor extends BaseExecutor {
         }, KEEPALIVE_INTERVAL_MS);
         try {
           while (!doneStreaming) {
-            const { value: msg, done } = await currentIterator.next();
+            const { value: msg, done } = preloaded.length
+              ? { value: preloaded.shift(), done: false }
+              : await currentIterator.next();
 
             if (done) {
               controller.enqueue(encoder.encode(SSE_DONE));
