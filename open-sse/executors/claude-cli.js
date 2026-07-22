@@ -551,9 +551,26 @@ export class ClaudeCliExecutor extends BaseExecutor {
       }
       if (done) break;
 
-      if (msg.type === "stream_event" || msg.type === "assistant") {
+      if (msg.type === "stream_event") {
         preloaded.push(msg);
         break;
+      }
+
+      if (msg.type === "assistant") {
+        // A canned billing/quota refusal can arrive as a *complete*
+        // "assistant" message with no preceding stream_event, immediately
+        // followed by a terminal "result" carrying is_error/api_error_status
+        // (see the matching comment in streamFromIterator's main loop below).
+        // A genuine reply always has stream_event deltas before its assistant
+        // summary, so if we're still in the peek loop when a bare assistant
+        // message shows up, it's this refusal shape — keep peeking instead of
+        // breaking out, so the upcoming "result" gets the same pre-flight
+        // error check below before we've committed to a 200 response
+        // (confirmed live: this was previously handing off to the real
+        // stream, combo.js logged "succeeded", and the session-limit error
+        // only surfaced after — too late to fall back to the next model).
+        preloaded.push(msg);
+        continue peekLoop;
       }
 
       if (msg.type === "result") {
